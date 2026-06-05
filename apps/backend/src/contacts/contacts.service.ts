@@ -1,5 +1,18 @@
 /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-argument */
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+  Logger,
+} from '@nestjs/common';
+import {
+  AutomationStatus,
+  CampaignStatus,
+  Contact,
+  Segment,
+} from '@prisma/client';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { PrismaService } from '../prisma/prisma.service';
 import { redisConnection } from '../queues/import.queue';
 import { SegmentRecalculationService } from '../queues/segment.recalculation.service';
@@ -38,9 +51,14 @@ export class ContactsService {
   constructor(
     private prisma: PrismaService,
     private segmentRecalculationService: SegmentRecalculationService,
+    private eventEmitter: EventEmitter2,
   ) {}
 
-  async createAuditLog(accountId: string, action: string, details: any) {
+  createAuditLog(
+    accountId: string,
+    action: string,
+    details: any,
+  ): Promise<any> {
     return this.prisma.auditLog.create({
       data: { accountId, action, details },
     });
@@ -58,10 +76,17 @@ export class ContactsService {
       if (!c.field || !c.operator || c.value === undefined) continue;
       let cond: any = {};
 
-      // ✅ CORRECTION PRINCIPALE : tags est Json? → utiliser array_contains
+      // tags est Json? → les opérateurs varient selon le type de recherche
       if (c.field === 'tag') {
-        // Pour Json: array_contains attend un tableau
-        cond = { tags: { array_contains: [String(c.value)] } };
+        if (c.operator === 'contains') {
+          // Recherche substring dans le tableau : Prisma sérialise le JSON en texte
+          // → string_contains cherche la sous-chaîne dans la représentation texte du tableau
+          // ex: ["CLIENT","NEWSLETTER"] contient "CLIE" → match
+          cond = { tags: { string_contains: String(c.value) } };
+        } else {
+          // Match exact d'un élément (equals / in)
+          cond = { tags: { array_contains: [String(c.value)] } };
+        }
       } else if (c.field === 'status') {
         const v = String(c.value).toLowerCase();
         if (v === 'inactive') cond = { optOut: true };
@@ -140,7 +165,14 @@ export class ContactsService {
     return { logic, rules };
   }
 
-  async findAll(accountId: string, params: any) {
+  async findAll(
+    accountId: string,
+    params: any,
+  ): Promise<{
+    data: Contact[];
+    nextCursor: string | null;
+    total: number;
+  }> {
     const limit = Math.min(params.limit || 20, 100);
     const isUnfiltered =
       !params.search &&
@@ -202,27 +234,55 @@ export class ContactsService {
     };
   }
 
-  async findById(accountId: string, id: string) {
+  findById(accountId: string, id: string): Promise<Contact | null> {
     return this.prisma.contact.findFirst({ where: { id, accountId } });
   }
 
-  async create(accountId: string, data: any) {
-    const c = await this.prisma.contact.create({
-      data: {
+  async create(accountId: string, data: any): Promise<Contact> {
+    try {
+      const c = await this.prisma.contact.create({
+        data: {
+          accountId,
+          ...data,
+          tags: data.tags || [],
+          optOut: data.optOut || false,
+        },
+      });
+      this.segmentRecalculationService
+        .addRecalculateAccountSegmentsJob(accountId)
+        .catch(() => {});
+      await this.invalidateContactCountCache(accountId);
+      this.eventEmitter.emit('contact.added', {
         accountId,
-        ...data,
-        tags: data.tags || [],
-        optOut: data.optOut || false,
-      },
-    });
-    this.segmentRecalculationService
-      .addRecalculateAccountSegmentsJob(accountId)
-      .catch(() => {});
-    await this.invalidateContactCountCache(accountId);
-    return c;
+        contactId: c.id,
+        contact: c,
+      });
+      await this.emitSegmentJoinedEvents(accountId, c);
+      return c;
+    } catch (err: unknown) {
+      // Handle unique constraint violations: return existing contact instead of error
+      // Prisma unique constraint code is P2002
+      const maybe = err as any;
+      if (maybe && maybe.code === 'P2002') {
+        // Try to find existing contact by email or phone
+        if (data.email) {
+          const existing = await this.prisma.contact.findFirst({
+            where: { accountId, email: data.email },
+          });
+          if (existing) return Object.assign(existing, { alreadyExists: true });
+        }
+        if (data.phone) {
+          const existing = await this.prisma.contact.findFirst({
+            where: { accountId, phone: data.phone },
+          });
+          if (existing) return Object.assign(existing, { alreadyExists: true });
+        }
+      }
+      throw err;
+    }
   }
 
-  async remove(accountId: string, id: string) {
+  async remove(accountId: string, id: string): Promise<{ success: true }> {
     await this.prisma.contact.delete({ where: { id, accountId } });
     this.segmentRecalculationService
       .addRecalculateAccountSegmentsJob(accountId)
@@ -231,7 +291,11 @@ export class ContactsService {
     return { success: true };
   }
 
-  async update(accountId: string, id: string, data: any) {
+  async update(
+    accountId: string,
+    id: string,
+    data: any,
+  ): Promise<Contact | null> {
     const existing = await this.prisma.contact.findFirst({
       where: { id, accountId },
     });
@@ -253,10 +317,11 @@ export class ContactsService {
       .addRecalculateAccountSegmentsJob(accountId)
       .catch(() => {});
     await this.invalidateContactCountCache(accountId);
+    await this.emitSegmentJoinedEvents(accountId, updated, existing);
     return updated;
   }
 
-  async optOut(accountId: string, id: string) {
+  async optOut(accountId: string, id: string): Promise<Contact | null> {
     const contact = await this.prisma.contact.findFirst({
       where: { id, accountId },
     });
@@ -272,11 +337,67 @@ export class ContactsService {
     return updated;
   }
 
+  private async getMatchingSegmentIds(accountId: string, contact: Contact) {
+    const segments = await this.prisma.segment.findMany({
+      where: { accountId, type: 'dynamic' },
+      select: { id: true, criteria: true },
+    });
+
+    const matched: string[] = [];
+    for (const segment of segments) {
+      try {
+        const parsed = this.normalizeSegmentCriteria(segment.criteria);
+        const where = this.buildWhereForSegment(
+          accountId,
+          parsed.logic,
+          parsed.rules,
+        );
+        const found = await this.prisma.contact.findFirst({
+          where: {
+            id: contact.id,
+            ...where,
+          },
+          select: { id: true },
+        });
+        if (found) matched.push(segment.id);
+      } catch (error) {
+        this.logger.warn(
+          `Impossible d'évaluer le segment ${segment.id} pour le contact ${contact.id}: ${String(error)}`,
+        );
+      }
+    }
+
+    return matched;
+  }
+
+  private async emitSegmentJoinedEvents(
+    accountId: string,
+    contact: Contact,
+    previousContact?: Contact,
+  ) {
+    const nextSegments = await this.getMatchingSegmentIds(accountId, contact);
+    const previousSegments = previousContact
+      ? await this.getMatchingSegmentIds(accountId, previousContact)
+      : [];
+
+    const joinedSegments = nextSegments.filter(
+      (segmentId) => !previousSegments.includes(segmentId),
+    );
+
+    for (const segmentId of joinedSegments) {
+      this.eventEmitter.emit('segment.joined', {
+        accountId,
+        contactId: contact.id,
+        segmentId,
+      });
+    }
+  }
+
   async exportContact(
     accountId: string,
     id: string,
     format: 'csv' | 'json' = 'csv',
-  ) {
+  ): Promise<string | null> {
     const contact = await this.prisma.contact.findFirst({
       where: { id, accountId },
     });
@@ -325,7 +446,7 @@ export class ContactsService {
   async previewSegment(
     accountId: string,
     payload: { logic: SegmentLogic; criteria: SegmentCriterion[] },
-  ) {
+  ): Promise<{ count: number }> {
     try {
       if (!payload.criteria?.length) {
         return {
@@ -363,14 +484,17 @@ export class ContactsService {
     }
   }
 
-  async listSegments(accountId: string) {
+  listSegments(accountId: string): Promise<Segment[]> {
     return this.prisma.segment.findMany({
       where: { accountId },
       orderBy: { id: 'desc' },
     });
   }
 
-  async listSegmentsWithContacts(accountId: string, limit?: number) {
+  async listSegmentsWithContacts(
+    accountId: string,
+    limit?: number,
+  ): Promise<any[]> {
     const segments = await this.prisma.segment.findMany({
       where: { accountId },
       orderBy: { id: 'desc' },
@@ -449,7 +573,7 @@ export class ContactsService {
       criteria: SegmentCriterion[];
       contactIds?: string[];
     },
-  ) {
+  ): Promise<any> {
     const selectedContactIds = Array.isArray(payload.contactIds)
       ? Array.from(
           new Set(
@@ -499,10 +623,155 @@ export class ContactsService {
     });
   }
 
-  async deleteSegment(accountId: string, id: string) {
-    const s = await this.prisma.segment.findFirst({ where: { id, accountId } });
-    if (!s) return null;
-    return this.prisma.segment.delete({ where: { id } });
+  async deleteSegment(
+    accountId: string,
+    id: string,
+  ): Promise<{ success: true } | null> {
+    const segment = await this.prisma.segment.findFirst({
+      where: { id, accountId },
+      select: { id: true },
+    });
+
+    if (!segment) {
+      return null;
+    }
+
+    const automationUsingSegment = await this.prisma.automation.findFirst({
+      where: {
+        accountId,
+        status: AutomationStatus.Active,
+        triggerType: 'segment_joined',
+        triggerConfig: {
+          path: ['segmentId'],
+          equals: id,
+        },
+      },
+      select: { id: true },
+    });
+
+    if (automationUsingSegment) {
+      throw new ConflictException(
+        'Ce segment est utilisé par une automatisation active',
+      );
+    }
+
+    const scheduledCampaignUsingSegment = await this.prisma.campaign.findFirst({
+      where: {
+        accountId,
+        segmentId: id,
+        status: CampaignStatus.SCHEDULED,
+      },
+      select: { id: true },
+    });
+
+    if (scheduledCampaignUsingSegment) {
+      throw new ConflictException(
+        'Ce segment est ciblé par une campagne planifiée',
+      );
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.campaign.updateMany({
+        where: {
+          accountId,
+          segmentId: id,
+          status: CampaignStatus.DRAFT,
+        },
+        data: { segmentId: null },
+      }),
+      this.prisma.segment.delete({ where: { id } }),
+    ]);
+
+    return { success: true };
+  }
+
+  async updateSegment(
+    accountId: string,
+    segmentId: string,
+    payload: {
+      name?: string;
+      logic?: SegmentLogic;
+      criteria?: SegmentCriterion[];
+      type?: 'dynamic' | 'static';
+      contactIds?: string[];
+    },
+  ): Promise<any> {
+    const existing = await this.prisma.segment.findFirst({
+      where: { id: segmentId, accountId },
+    });
+
+    if (!existing) {
+      throw new NotFoundException('Segment non trouve');
+    }
+
+    const nextName = payload.name?.trim() || existing.name || 'Segment';
+    const nextType = payload.type || (existing.type as 'dynamic' | 'static');
+
+    if (nextType === 'static') {
+      const contactIds = Array.isArray(payload.contactIds)
+        ? Array.from(
+            new Set(
+              payload.contactIds.filter(
+                (id) => typeof id === 'string' && id.trim().length > 0,
+              ),
+            ),
+          )
+        : [];
+
+      const count = await this.prisma.contact.count({
+        where: {
+          accountId,
+          id: { in: contactIds },
+          optOut: false,
+        },
+      });
+
+      return this.prisma.segment.update({
+        where: { id: segmentId },
+        data: {
+          name: nextName,
+          type: 'static',
+          criteria: { contactIds },
+          contactCount: count,
+          lastCalculated: new Date(),
+        },
+      });
+    }
+
+    const rules = Array.isArray(payload.criteria)
+      ? payload.criteria
+      : this.normalizeSegmentCriteria(existing.criteria).rules;
+    const logic = payload.logic === 'OR' ? 'OR' : 'AND';
+
+    if (rules.length === 0) {
+      throw new BadRequestException(
+        'Le segment doit contenir au moins un critère',
+      );
+    }
+
+    const where = this.buildWhereForSegment(accountId, logic, rules);
+    const count = await this.prisma.contact.count({ where });
+
+    return this.prisma.segment.update({
+      where: { id: segmentId },
+      data: {
+        name: nextName,
+        type: 'dynamic',
+        criteria: { logic, rules },
+        contactCount: count,
+        lastCalculated: new Date(),
+      },
+    });
+  }
+
+  async getSegmentWithContacts(
+    accountId: string,
+    segmentId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const segments = (await this.listSegmentsWithContacts(accountId)) as Array<
+      Record<string, unknown> & { id: string }
+    >;
+    return segments.find((segment) => segment.id === segmentId) ?? null;
   }
 
   /**
@@ -562,7 +831,15 @@ export class ContactsService {
   async getSegmentContactsForCampaign(
     accountId: string,
     segmentId?: string,
-  ): Promise<any[]> {
+  ): Promise<
+    Array<{
+      id: string;
+      email: string | null;
+      phone: string | null;
+      firstName: string | null;
+      lastName: string | null;
+    }>
+  > {
     try {
       if (!segmentId) {
         // Tous les contacts actifs

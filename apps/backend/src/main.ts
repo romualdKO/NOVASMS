@@ -1,4 +1,5 @@
 import { NestFactory } from '@nestjs/core';
+import * as bodyParser from 'body-parser';
 import { AppModule } from './app.module';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { ValidationPipe } from '@nestjs/common';
@@ -11,11 +12,24 @@ async function bootstrap() {
   // Préfixe global pour toutes les routes API
   app.setGlobalPrefix('api');
 
-  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+  // CORS doit être activé AVANT bodyParser pour que les headers
+  // soient présents même sur les réponses d'erreur (413, 401, etc.)
   app.enableCors({
     origin: [/^http:\/\/localhost(:\d+)?$/, /^http:\/\/127\.0\.0\.1(:\d+)?$/],
     credentials: true,
   });
+
+  // Capture raw body + limite portée à 10 Mo pour les imports CSV en chunks
+  app.use(
+    bodyParser.json({
+      limit: '10mb',
+      verify: (req: any, _res, buf: Buffer) => {
+        req.rawBody = buf;
+      },
+    }),
+  );
+
+  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
 
   const config = new DocumentBuilder()
     .setTitle('NovaSMS API')

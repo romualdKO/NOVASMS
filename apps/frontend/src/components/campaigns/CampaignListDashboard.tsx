@@ -1,6 +1,8 @@
 import type { FC } from 'react';
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
+import * as Dialog from '@radix-ui/react-dialog';
+import { toast } from 'sonner';
 import { useCampaignStore } from '@/store/campaign.store';
 import { useCampaignActions } from '@/hooks/useCampaign';
 import type { Campaign, CampaignStatus } from '@/store/campaign.store';
@@ -18,19 +20,18 @@ import type { Campaign, CampaignStatus } from '@/store/campaign.store';
 
 const CampaignListDashboard: FC = () => {
   const navigate = useNavigate();
-  const {
-    campaigns,
-    deleteCampaign,
-    isLoading,
-    error,
-  } = useCampaignStore();
+  const { campaigns, deleteCampaign, fetchCampaigns, isLoading, error } = useCampaignStore();
   const { duplicateCampaign } = useCampaignActions();
 
   const [statusFilter, setStatusFilter] = useState<CampaignStatus | 'all'>('all');
   const [channelFilter, setChannelFilter] = useState<'all' | 'SMS' | 'EMAIL'>('all');
   const [sortBy, setSortBy] = useState<'date' | 'cost'>('date');
   const [searchTerm, setSearchTerm] = useState('');
-  const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Campaign | null>(null);
+
+  useEffect(() => {
+    void fetchCampaigns();
+  }, [fetchCampaigns]);
 
   const filteredCampaigns = useMemo<Campaign[]>(() => {
     let result = [...campaigns];
@@ -44,15 +45,11 @@ const CampaignListDashboard: FC = () => {
     }
 
     if (searchTerm) {
-      result = result.filter((c) =>
-        c.name.toLowerCase().includes(searchTerm.toLowerCase())
-      );
+      result = result.filter((c) => c.name.toLowerCase().includes(searchTerm.toLowerCase()));
     }
 
     if (sortBy === 'date') {
-      result.sort(
-        (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
-      );
+      result.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
     } else if (sortBy === 'cost') {
       result.sort((a, b) => b.estimatedCost - a.estimatedCost);
     }
@@ -60,11 +57,21 @@ const CampaignListDashboard: FC = () => {
     return result;
   }, [campaigns, statusFilter, channelFilter, sortBy, searchTerm]);
 
-  const handleDelete = async (id: string) => {
+  const groupedCampaigns = useMemo(() => {
+    const automation = filteredCampaigns.filter((campaign) => campaign.status === 'automation');
+    const classic = filteredCampaigns.filter((campaign) => campaign.status !== 'automation');
+
+    return { automation, classic };
+  }, [filteredCampaigns]);
+
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
     try {
-      await deleteCampaign(id);
-      setDeleteConfirm(null);
+      await deleteCampaign(deleteTarget.id);
+      toast.success('Campagne supprimée avec succès');
+      setDeleteTarget(null);
     } catch (error) {
+      toast.error('Suppression impossible pour cette campagne');
       console.error('Failed to delete campaign:', error);
     }
   };
@@ -81,15 +88,17 @@ const CampaignListDashboard: FC = () => {
         return 'bg-secondary/20 text-secondary';
       case 'failed':
         return 'bg-error/20 text-error';
+      case 'cancelled':
+        return 'bg-secondary/20 text-secondary';
+      case 'automation':
+        return 'bg-tertiary/20 text-tertiary';
       default:
         return 'bg-outline/20 text-on-surface-variant';
     }
   };
 
   const getChannelIcon = (channel: string) => {
-    return channel === 'SMS'
-      ? '💬'
-      : '📧';
+    return channel === 'SMS' ? '💬' : '📧';
   };
 
   const formatDate = (date: Date | string) => {
@@ -105,255 +114,369 @@ const CampaignListDashboard: FC = () => {
     return `${amount.toFixed(2)} FCFA`;
   };
 
-  return (
-    <div className="max-w-7xl mx-auto px-8 py-12">
-      {/* Header */}
-      <div className="mb-12">
-        <h1 className="font-headline font-black text-4xl text-on-surface mb-2">
-          Campagnes
-        </h1>
-        <p className="text-on-surface-variant text-lg">
-          Gérez, modifiez et suivez toutes vos campagnes de marketing
-        </p>
-      </div>
+  const renderCampaignCard = (campaign: Campaign, tone: 'automation' | 'classic') => (
+    <div
+      key={campaign.id}
+      className={`relative rounded-2xl p-6 flex items-center justify-between transition-all border ${tone === 'automation' ? 'bg-primary/5 border-primary/15 hover:bg-primary/10' : 'bg-surface-container border-outline-variant/10 hover:bg-surface-container-high'}`}
+    >
+      <div className="absolute left-0 top-0 h-full w-1.5 rounded-l-2xl bg-current opacity-70" />
 
-      {/* Controls */}
-      <div className="space-y-6 mb-8">
-        {/* Search & Create */}
-        <div className="flex gap-4">
+      {/* Left: Campaign Info */}
+      <div className="flex-1 flex items-start gap-6 pl-2">
+        {/* Channel Icon & Name */}
+        <div className="flex items-start gap-4 flex-1">
+          <div className="text-4xl">{getChannelIcon(campaign.channel)}</div>
           <div className="flex-1">
-            <input
-              type="text"
-              placeholder="Rechercher une campagne..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="w-full px-4 py-3 bg-surface-container-lowest border border-outline-variant focus:border-primary focus:ring-2 focus:ring-primary/20 rounded-xl font-body text-on-surface transition-all"
-            />
-          </div>
-          <Link
-            to="/campaigns/new"
-            className="px-6 py-3 bg-primary text-on-primary font-bold rounded-xl hover:brightness-110 transition-all active:scale-95 flex items-center gap-2"
-          >
-            <span className="material-symbols-outlined">add</span>
-            Nouvelle campagne
-          </Link>
-        </div>
+            <div className="mb-2 flex items-center gap-2">
+              <h3 className="font-headline font-bold text-lg text-on-surface">{campaign.name}</h3>
+              {tone === 'automation' && (
+                <span className="rounded-full bg-tertiary/15 px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest text-tertiary">
+                  Automatisation
+                </span>
+              )}
+            </div>
+            {campaign.description && (
+              <p className="text-on-surface-variant text-sm mb-3">{campaign.description}</p>
+            )}
+            <div className="flex items-center gap-3 flex-wrap">
+              <span
+                className={`text-xs font-bold px-3 py-1 rounded-full ${getStatusBadgeColor(
+                  campaign.status,
+                )}`}
+              >
+                {campaign.status === 'draft' && 'Brouillon'}
+                {campaign.status === 'scheduled' && 'Planifiée'}
+                {campaign.status === 'sent' && 'Envoyée'}
+                {campaign.status === 'paused' && 'Pause'}
+                {campaign.status === 'failed' && 'Échouée'}
+                {campaign.status === 'cancelled' && 'Annulée'}
+                {campaign.status === 'automation' && 'Automatisation'}
+              </span>
 
-        {/* Filters */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          {/* Status Filter */}
-          <div className="space-y-2">
-            <label className="text-label-sm font-bold uppercase tracking-widest text-on-surface-variant">
-              Statut
-            </label>
-            <select
-              value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value as CampaignStatus | 'all')}
-              className="w-full px-4 py-2 bg-surface-container-lowest border border-outline-variant focus:ring-2 focus:ring-primary rounded-lg font-body text-on-surface"
-            >
-              <option value="all">Tous</option>
-              <option value="draft">Brouillon</option>
-              <option value="scheduled">Planifiée</option>
-              <option value="sent">Envoyée</option>
-              <option value="paused">Mise en pause</option>
-              <option value="failed">Échouée</option>
-            </select>
-          </div>
-
-          {/* Channel Filter */}
-          <div className="space-y-2">
-            <label className="text-label-sm font-bold uppercase tracking-widest text-on-surface-variant">
-              Canal
-            </label>
-            <select
-              value={channelFilter}
-              onChange={(e) => setChannelFilter(e.target.value as 'all' | 'SMS' | 'EMAIL')}
-              className="w-full px-4 py-2 bg-surface-container-lowest border border-outline-variant focus:ring-2 focus:ring-primary rounded-lg font-body text-on-surface"
-            >
-              <option value="all">Tous</option>
-              <option value="SMS">SMS</option>
-              <option value="EMAIL">Email</option>
-            </select>
-          </div>
-
-          {/* Sort */}
-          <div className="space-y-2">
-            <label className="text-label-sm font-bold uppercase tracking-widest text-on-surface-variant">
-              Trier par
-            </label>
-            <select
-              value={sortBy}
-              onChange={(e) => setSortBy(e.target.value as 'date' | 'cost')}
-              className="w-full px-4 py-2 bg-surface-container-lowest border border-outline-variant focus:ring-2 focus:ring-primary rounded-lg font-body text-on-surface"
-            >
-              <option value="date">Date (récent)</option>
-              <option value="cost">Coût (élevé)</option>
-            </select>
-          </div>
-
-          {/* Stats */}
-          <div className="bg-primary/10 rounded-lg p-4 flex flex-col justify-center">
-            <p className="text-on-surface-variant text-xs font-bold uppercase">Total</p>
-            <p className="font-headline font-black text-2xl text-primary">
-              {filteredCampaigns.length}
-            </p>
-          </div>
-        </div>
-      </div>
-
-      {/* Error Message */}
-      {error && (
-        <div className="mb-6 p-4 bg-error/10 border border-error/30 rounded-lg flex items-center gap-3">
-          <span className="material-symbols-outlined text-error">error</span>
-          <p className="text-error text-sm">{error}</p>
-        </div>
-      )}
-
-      {/* Campaign List */}
-      {filteredCampaigns.length === 0 ? (
-        <div className="bg-surface-container rounded-2xl p-12 text-center">
-          <span className="material-symbols-outlined text-8xl text-outline/50 block mb-4">
-            mail
-          </span>
-          <p className="text-on-surface-variant text-lg">
-            {searchTerm
-              ? 'Aucune campagne trouvée'
-              : 'Aucune campagne. Créez votre première campagne!'}
-          </p>
-          <Link
-            to="/campaigns/new"
-            className="mt-6 inline-block px-6 py-3 bg-primary text-on-primary font-bold rounded-lg hover:brightness-110 transition-all"
-          >
-            Créer une campagne
-          </Link>
-        </div>
-      ) : (
-        <div className="space-y-4">
-          {filteredCampaigns.map((campaign) => (
-            <div
-              key={campaign.id}
-              className="relative bg-surface-container rounded-2xl p-6 flex items-center justify-between hover:bg-surface-container-high transition-all border border-outline-variant/10"
-            >
-              {/* Left: Campaign Info */}
-              <div className="flex-1 flex items-start gap-6">
-                {/* Channel Icon & Name */}
-                <div className="flex items-start gap-4 flex-1">
-                  <div className="text-4xl">{getChannelIcon(campaign.channel)}</div>
-                  <div className="flex-1">
-                    <h3 className="font-headline font-bold text-lg text-on-surface mb-1">
-                      {campaign.name}
-                    </h3>
-                    {campaign.description && (
-                      <p className="text-on-surface-variant text-sm mb-3">
-                        {campaign.description}
-                      </p>
-                    )}
-                    <div className="flex items-center gap-3 flex-wrap">
-                      {/* Status Badge */}
-                      <span
-                        className={`text-xs font-bold px-3 py-1 rounded-full ${getStatusBadgeColor(
-                          campaign.status
-                        )}`}
-                      >
-                        {campaign.status === 'draft' && 'Brouillon'}
-                        {campaign.status === 'scheduled' && 'Planifiée'}
-                        {campaign.status === 'sent' && 'Envoyée'}
-                        {campaign.status === 'paused' && 'Pause'}
-                        {campaign.status === 'failed' && 'Échouée'}
-                      </span>
-
-                      {/* Recipients */}
-                      <div className="text-xs text-on-surface-variant flex items-center gap-1">
-                        <span className="material-symbols-outlined text-sm">group</span>
-                        {campaign.estimatedRecipients.toLocaleString('fr-FR')} contacts
-                      </div>
-
-                      {/* Date */}
-                      <div className="text-xs text-on-surface-variant flex items-center gap-1">
-                        <span className="material-symbols-outlined text-sm">schedule</span>
-                        {formatDate(campaign.updatedAt)}
-                      </div>
-                    </div>
-                  </div>
-                </div>
+              <div className="text-xs text-on-surface-variant flex items-center gap-1">
+                <span className="material-symbols-outlined text-sm">group</span>
+                {campaign.estimatedRecipients.toLocaleString('fr-FR')} contacts
               </div>
 
-              {/* Right: Cost & Actions */}
-              <div className="flex items-center gap-6">
-                {/* Cost */}
-                <div className="text-right">
-                  <p className="text-on-surface-variant text-xs font-bold uppercase">Coût</p>
-                  <p className="font-headline font-black text-2xl text-primary">
-                    {formatCost(campaign.estimatedCost)}
-                  </p>
-                </div>
-
-                {/* Actions */}
-                <div className="flex items-center gap-2">
-                  {/* View */}
-                  <Link
-                    to={`/campaigns/${campaign.id}`}
-                    className="p-2 hover:bg-surface-container-high rounded-lg transition-all"
-                    title="Voir"
-                  >
-                    <span className="material-symbols-outlined">visibility</span>
-                  </Link>
-
-                  {/* Edit (only for draft) */}
-                  {campaign.status === 'draft' && (
-                    <Link
-                      to={`/campaigns/${campaign.id}/edit`}
-                      className="p-2 hover:bg-surface-container-high rounded-lg transition-all"
-                      title="Modifier"
-                    >
-                      <span className="material-symbols-outlined">edit</span>
-                    </Link>
-                  )}
-
-                  {/* Duplicate */}
-                  <button
-                    onClick={async () => {
-                      await duplicateCampaign(campaign);
-                      navigate('/campaigns/new');
-                    }}
-                    className="p-2 hover:bg-surface-container-high rounded-lg transition-all"
-                    title="Dupliquer"
-                  >
-                    <span className="material-symbols-outlined">content_copy</span>
-                  </button>
-
-                  {/* Delete */}
-                  {deleteConfirm === campaign.id ? (
-                    <div className="absolute right-4 bg-surface-container rounded-lg shadow-lg p-3 flex gap-2">
-                      <button
-                        onClick={() => handleDelete(campaign.id)}
-                        disabled={isLoading}
-                        className="px-3 py-1 bg-error text-on-primary text-xs font-bold rounded disabled:opacity-50"
-                      >
-                        Confirmer
-                      </button>
-                      <button
-                        onClick={() => setDeleteConfirm(null)}
-                        className="px-3 py-1 bg-outline/20 text-on-surface text-xs font-bold rounded"
-                      >
-                        Annuler
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      onClick={() => setDeleteConfirm(campaign.id)}
-                      className="p-2 hover:bg-surface-container-high rounded-lg transition-all"
-                      title="Supprimer"
-                    >
-                      <span className="material-symbols-outlined text-error">delete</span>
-                    </button>
-                  )}
-                </div>
+              <div className="text-xs text-on-surface-variant flex items-center gap-1">
+                <span className="material-symbols-outlined text-sm">schedule</span>
+                {formatDate(campaign.updatedAt)}
               </div>
             </div>
-          ))}
+          </div>
         </div>
-      )}
+      </div>
+
+      {/* Right: Cost & Actions */}
+      <div className="flex items-center gap-6">
+        <div className="text-right">
+          <p className="text-on-surface-variant text-xs font-bold uppercase">Coût</p>
+          <p className="font-headline font-black text-2xl text-primary">
+            {formatCost(campaign.estimatedCost)}
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Link
+            to={`/campaigns/${campaign.id}`}
+            className="p-2 hover:bg-surface-container-high rounded-lg transition-all"
+            title="Voir"
+          >
+            <span className="material-symbols-outlined">visibility</span>
+          </Link>
+
+          <Link
+            to={`/campaigns/${campaign.id}/report`}
+            className="p-2 hover:bg-surface-container-high rounded-lg transition-all text-secondary"
+            title="Rapport"
+          >
+            <span className="material-symbols-outlined">bar_chart</span>
+          </Link>
+
+          <Link
+            to={`/campaigns/${campaign.id}/edit`}
+            className="p-2 hover:bg-surface-container-high rounded-lg transition-all"
+            title="Modifier"
+          >
+            <span className="material-symbols-outlined">edit</span>
+          </Link>
+
+          <button
+            onClick={async () => {
+              const duplicated = await duplicateCampaign(campaign);
+              toast.success('Campagne dupliquée');
+              navigate(`/campaigns/${duplicated.id}/edit`);
+            }}
+            className="p-2 hover:bg-surface-container-high rounded-lg transition-all"
+            title="Dupliquer"
+          >
+            <span className="material-symbols-outlined">content_copy</span>
+          </button>
+
+          <button
+            onClick={() => setDeleteTarget(campaign)}
+            className="p-2 hover:bg-surface-container-high rounded-lg transition-all"
+            title="Supprimer"
+          >
+            <span className="material-symbols-outlined text-error">delete</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="mx-auto max-w-7xl px-6 py-10 lg:px-8">
+      <div className="space-y-8">
+        <section className="overflow-hidden rounded-[28px] border border-outline-variant/20 bg-gradient-to-br from-white via-surface to-brand-light/40 shadow-[0_18px_50px_rgba(12,84,96,0.08)]">
+          <div className="flex flex-col gap-6 px-6 py-7 lg:flex-row lg:items-end lg:justify-between lg:px-8 lg:py-8">
+            <div className="max-w-2xl space-y-3">
+              <p className="text-[10px] font-bold uppercase tracking-[0.24em] text-on-surface-variant">
+                Centre de pilotage
+              </p>
+              <h1 className="text-4xl font-black text-on-surface lg:text-5xl">Campagnes</h1>
+              <p className="max-w-xl text-base leading-7 text-on-surface-variant lg:text-lg">
+                Gérez vos campagnes SMS et Email avec une vue claire sur les statuts, les coûts et
+                les actions rapides.
+              </p>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-3 lg:w-[34rem]">
+              <div className="rounded-2xl border border-outline-variant/20 bg-white/80 px-4 py-4 shadow-sm backdrop-blur">
+                <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-on-surface-variant">
+                  Total
+                </p>
+                <p className="mt-1 text-2xl font-black text-primary">{filteredCampaigns.length}</p>
+              </div>
+              <div className="rounded-2xl border border-outline-variant/20 bg-white/80 px-4 py-4 shadow-sm backdrop-blur">
+                <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-on-surface-variant">
+                  Automatisées
+                </p>
+                <p className="mt-1 text-2xl font-black text-tertiary">
+                  {groupedCampaigns.automation.length}
+                </p>
+              </div>
+              <div className="rounded-2xl border border-outline-variant/20 bg-white/80 px-4 py-4 shadow-sm backdrop-blur">
+                <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-on-surface-variant">
+                  Classiques
+                </p>
+                <p className="mt-1 text-2xl font-black text-secondary">
+                  {groupedCampaigns.classic.length}
+                </p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="rounded-[28px] border border-outline-variant/20 bg-white p-6 shadow-sm lg:p-7">
+          <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+            <div className="flex-1">
+              <label className="sr-only" htmlFor="campaign-search">
+                Rechercher une campagne
+              </label>
+              <input
+                id="campaign-search"
+                type="text"
+                placeholder="Rechercher une campagne..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="w-full rounded-2xl border border-outline-variant/40 bg-surface-container-lowest px-4 py-3 text-sm text-on-surface outline-none transition focus:border-primary focus:ring-4 focus:ring-primary/10"
+              />
+            </div>
+
+            <div className="flex flex-wrap gap-3">
+              <Link
+                id="tour-new-campaign-btn"
+                to="/campaigns/new"
+                className="inline-flex items-center justify-center gap-2 rounded-2xl bg-secondary px-5 py-3 text-sm font-bold text-white transition hover:bg-secondary/90 active:scale-[0.99]"
+              >
+                <span className="material-symbols-outlined text-[18px]">add</span>
+                Nouvelle campagne
+              </Link>
+              <Link
+                to="/campaigns/new?mode=automation"
+                className="inline-flex items-center justify-center gap-2 rounded-2xl border border-primary/25 bg-primary/5 px-5 py-3 text-sm font-bold text-primary transition hover:bg-primary/10 active:scale-[0.99]"
+              >
+                <span className="material-symbols-outlined text-[18px]">bolt</span>
+                Campagne automatisée
+              </Link>
+            </div>
+          </div>
+
+          <div className="mt-5 grid gap-4 lg:grid-cols-[1.1fr_1.1fr_0.9fr_0.7fr]">
+            <label className="space-y-2">
+              <span className="text-[10px] font-bold uppercase tracking-[0.22em] text-on-surface-variant">
+                Statut
+              </span>
+              <select
+                value={statusFilter}
+                onChange={(e) => setStatusFilter(e.target.value as CampaignStatus | 'all')}
+                className="w-full rounded-2xl border border-outline-variant/40 bg-surface-container-lowest px-4 py-3 text-sm text-on-surface outline-none transition focus:border-primary focus:ring-4 focus:ring-primary/10"
+              >
+                <option value="all">Tous</option>
+                <option value="draft">Brouillon</option>
+                <option value="scheduled">Planifiée</option>
+                <option value="sent">Envoyée</option>
+                <option value="paused">Mise en pause</option>
+                <option value="failed">Échouée</option>
+                <option value="cancelled">Annulée</option>
+                <option value="automation">Automatisation</option>
+              </select>
+            </label>
+
+            <label className="space-y-2">
+              <span className="text-[10px] font-bold uppercase tracking-[0.22em] text-on-surface-variant">
+                Canal
+              </span>
+              <select
+                value={channelFilter}
+                onChange={(e) => setChannelFilter(e.target.value as 'all' | 'SMS' | 'EMAIL')}
+                className="w-full rounded-2xl border border-outline-variant/40 bg-surface-container-lowest px-4 py-3 text-sm text-on-surface outline-none transition focus:border-primary focus:ring-4 focus:ring-primary/10"
+              >
+                <option value="all">Tous</option>
+                <option value="SMS">SMS</option>
+                <option value="EMAIL">Email</option>
+              </select>
+            </label>
+
+            <label className="space-y-2">
+              <span className="text-[10px] font-bold uppercase tracking-[0.22em] text-on-surface-variant">
+                Trier par
+              </span>
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as 'date' | 'cost')}
+                className="w-full rounded-2xl border border-outline-variant/40 bg-surface-container-lowest px-4 py-3 text-sm text-on-surface outline-none transition focus:border-primary focus:ring-4 focus:ring-primary/10"
+              >
+                <option value="date">Date (récent)</option>
+                <option value="cost">Coût (élevé)</option>
+              </select>
+            </label>
+
+            <div className="rounded-2xl border border-primary/15 bg-primary/5 px-4 py-3">
+              <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-on-surface-variant">
+                Résultats
+              </p>
+              <p className="mt-1 text-2xl font-black text-primary">{filteredCampaigns.length}</p>
+            </div>
+          </div>
+
+          {error && (
+            <div className="mt-5 flex items-start gap-3 rounded-2xl border border-error/20 bg-error/5 px-4 py-3 text-sm text-error">
+              <span className="material-symbols-outlined mt-0.5 text-[18px]">error</span>
+              <p>{error}</p>
+            </div>
+          )}
+        </section>
+
+        {filteredCampaigns.length === 0 ? (
+          <section className="rounded-[28px] border border-dashed border-outline-variant/30 bg-white p-12 text-center shadow-sm">
+            <span className="material-symbols-outlined mb-4 block text-7xl text-outline/40">
+              mail
+            </span>
+            <p className="text-lg text-on-surface-variant">
+              {searchTerm
+                ? 'Aucune campagne trouvée'
+                : 'Aucune campagne. Créez votre première campagne.'}
+            </p>
+            <Link
+              to="/campaigns/new"
+              className="mt-6 inline-flex items-center justify-center rounded-2xl bg-secondary px-5 py-3 text-sm font-bold text-white transition hover:bg-secondary/90"
+            >
+              Créer une campagne
+            </Link>
+          </section>
+        ) : (
+          <div className="space-y-8">
+            <section className="space-y-4 rounded-[28px] border border-tertiary/10 bg-white p-5 shadow-sm lg:p-6">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-xs font-bold uppercase tracking-[0.24em] text-tertiary">
+                    Automatisées
+                  </h2>
+                  <p className="mt-1 text-sm text-on-surface-variant">
+                    Campagnes déclenchées depuis le parcours automatisé.
+                  </p>
+                </div>
+                <span className="rounded-full bg-tertiary/10 px-3 py-1 text-xs font-bold text-tertiary">
+                  {groupedCampaigns.automation.length}
+                </span>
+              </div>
+
+              {groupedCampaigns.automation.length > 0 ? (
+                <div className="space-y-4">
+                  {groupedCampaigns.automation.map((campaign) =>
+                    renderCampaignCard(campaign, 'automation'),
+                  )}
+                </div>
+              ) : (
+                <div className="rounded-2xl border border-dashed border-tertiary/20 bg-tertiary/5 p-6 text-sm text-on-surface-variant">
+                  Aucune campagne automatisée ne correspond à vos filtres.
+                </div>
+              )}
+            </section>
+
+            <section className="space-y-4 rounded-[28px] border border-primary/10 bg-white p-5 shadow-sm lg:p-6">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-xs font-bold uppercase tracking-[0.24em] text-primary">
+                    Classiques
+                  </h2>
+                  <p className="mt-1 text-sm text-on-surface-variant">
+                    Campagnes créées via le parcours standard avec audience.
+                  </p>
+                </div>
+                <span className="rounded-full bg-primary/10 px-3 py-1 text-xs font-bold text-primary">
+                  {groupedCampaigns.classic.length}
+                </span>
+              </div>
+
+              {groupedCampaigns.classic.length > 0 ? (
+                <div className="space-y-4">
+                  {groupedCampaigns.classic.map((campaign) =>
+                    renderCampaignCard(campaign, 'classic'),
+                  )}
+                </div>
+              ) : (
+                <div className="rounded-2xl border border-dashed border-primary/20 bg-primary/5 p-6 text-sm text-on-surface-variant">
+                  Aucune campagne classique ne correspond à vos filtres.
+                </div>
+              )}
+            </section>
+          </div>
+        )}
+      </div>
+
+      <Dialog.Root
+        open={Boolean(deleteTarget)}
+        onOpenChange={(open: boolean) => !open && setDeleteTarget(null)}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 z-50 bg-black/45" />
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-[92vw] max-w-md -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-outline-variant/30 bg-surface p-6 shadow-2xl">
+            <Dialog.Title className="text-xl font-bold text-on-surface">
+              Supprimer la campagne ?
+            </Dialog.Title>
+            <Dialog.Description className="mt-2 text-sm text-on-surface-variant">
+              Cette action est irréversible pour <strong>{deleteTarget?.name}</strong>.
+            </Dialog.Description>
+            <div className="mt-6 flex justify-end gap-3">
+              <Dialog.Close className="rounded-lg border border-outline-variant/40 px-4 py-2 text-sm font-semibold text-on-surface hover:bg-surface-container-high">
+                Annuler
+              </Dialog.Close>
+              <button
+                type="button"
+                onClick={() => void handleDelete()}
+                disabled={isLoading}
+                className="rounded-lg px-4 py-2 text-sm font-semibold text-white hover:brightness-110 disabled:opacity-60"
+                style={{ background: '#dc2626' }}
+              >
+                {isLoading ? 'Suppression…' : 'Supprimer'}
+              </button>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </div>
   );
 };

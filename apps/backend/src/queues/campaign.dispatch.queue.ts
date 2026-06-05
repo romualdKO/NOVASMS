@@ -6,6 +6,11 @@ import { PrismaService } from '../prisma/prisma.service';
 import { MailService } from '../mail/mail.service';
 import { EmailProviderFactory } from '../providers/email/email.provider.factory';
 import { SmsProviderFactory } from '../providers/sms/sms.provider.factory';
+import { WhatsappProviderFactory } from '../providers/whatsapp/whatsapp.provider.factory';
+import {
+  createTrackingToken,
+  getTrackingBaseUrl,
+} from '../track/track-token.util';
 import {
   CampaignStatus,
   CampaignVariant,
@@ -41,12 +46,148 @@ function escapeHtml(value: string): string {
     .replaceAll("'", '&#39;');
 }
 
+function resolveCampaignImagePublicBaseUrl(): string | null {
+  const rawBaseUrl =
+    process.env.CAMPAIGN_IMAGE_PUBLIC_BASE_URL?.trim() ||
+    process.env.S3_ENDPOINT?.trim() ||
+    process.env.CAMPAIGN_IMAGE_S3_ENDPOINT?.trim();
+
+  if (!rawBaseUrl) {
+    return null;
+  }
+
+  const cleanedBaseUrl = rawBaseUrl.replace(/\/$/, '');
+  const bucketName = process.env.CAMPAIGN_IMAGE_BUCKET?.trim();
+
+  if (!bucketName || cleanedBaseUrl.endsWith(`/${bucketName}`)) {
+    return cleanedBaseUrl;
+  }
+
+  return `${cleanedBaseUrl}/${bucketName}`;
+}
+
+function extractCampaignImageFileName(src: string): string | null {
+  const cleanSrc = src.split('#')[0]?.split('?')[0] || src;
+  const fileName = cleanSrc.split('/').filter(Boolean).pop();
+  return fileName || null;
+}
+
+function shouldRewriteCampaignImageSource(src: string): boolean {
+  if (!src || src.startsWith('data:') || src.startsWith('cid:')) {
+    return false;
+  }
+
+  if (src.startsWith('/')) {
+    return true;
+  }
+
+  return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//i.test(src);
+}
+
+function rewriteCampaignImageSource(src: string): string {
+  if (!shouldRewriteCampaignImageSource(src)) {
+    return src;
+  }
+
+  const publicBaseUrl = resolveCampaignImagePublicBaseUrl();
+  const fileName = extractCampaignImageFileName(src);
+
+  if (!publicBaseUrl || !fileName) {
+    return src;
+  }
+
+  return `${publicBaseUrl}/${fileName}`;
+}
+
+function rewriteCampaignEmailHtmlImageSources(html: string): string {
+  return html.replace(
+    /(<img\b[^>]*\bsrc=)(["'])([^"']+)(\2)/gi,
+    (_match, prefix: string, quote: string, src: string) => {
+      return `${prefix}${quote}${escapeHtml(rewriteCampaignImageSource(src))}${quote}`;
+    },
+  );
+}
+
+function rewriteTrackedAnchors(html: string, sendId: string): string {
+  const token = createTrackingToken(sendId);
+  const trackingBaseUrl = getTrackingBaseUrl();
+
+  return html.replace(
+    /(<a\b[^>]*\bhref=)(["'])([^"']+)(\2)/gi,
+    (_match, prefix: string, quote: string, href: string) => {
+      if (!/^https?:\/\//i.test(href)) {
+        return `${prefix}${quote}${escapeHtml(href)}${quote}`;
+      }
+
+      if (/\/track\/click\?/i.test(href)) {
+        return `${prefix}${quote}${escapeHtml(href)}${quote}`;
+      }
+
+      const trackedHref = `${trackingBaseUrl}/track/click?sendId=${encodeURIComponent(sendId)}&url=${encodeURIComponent(href)}&t=${encodeURIComponent(token)}`;
+      return `${prefix}${quote}${escapeHtml(trackedHref)}${quote}`;
+    },
+  );
+}
+
+function injectOpenTrackingPixel(html: string, sendId: string): string {
+  const token = createTrackingToken(sendId);
+  const trackingBaseUrl = getTrackingBaseUrl();
+  const pixelUrl = `${trackingBaseUrl}/track/open?sendId=${encodeURIComponent(sendId)}&t=${encodeURIComponent(token)}`;
+  const pixelTag = `<img src="${escapeHtml(pixelUrl)}" width="1" height="1" style="display:none;" alt=""/>`;
+
+  if (/<\/body>/i.test(html)) {
+    return html.replace(/<\/body>/i, `${pixelTag}</body>`);
+  }
+
+  return `${html}${pixelTag}`;
+}
+
+function applyTrackingToEmailHtml(html: string, sendId: string): string {
+  const rewrittenAnchors = rewriteTrackedAnchors(html, sendId);
+  return injectOpenTrackingPixel(rewrittenAnchors, sendId);
+}
+
+function normalizeSmsPhoneNumber(phone: string): string | null {
+  const cleaned = phone.replace(/[\s().-]/g, '').trim();
+
+  if (/^\+\d{8,15}$/.test(cleaned)) {
+    return cleaned;
+  }
+
+  if (/^00\d{8,15}$/.test(cleaned)) {
+    const normalized = `+${cleaned.slice(2)}`;
+    return /^\+\d{8,15}$/.test(normalized) ? normalized : null;
+  }
+
+  if (/^\d{8,15}$/.test(cleaned)) {
+    return `+${cleaned}`;
+  }
+
+  return null;
+}
+
 function personalizeText(
   value: string,
-  context: { firstName?: string; companyName?: string; promoCode?: string },
+  context: {
+    firstName?: string;
+    lastName?: string;
+    fullName?: string;
+    email?: string;
+    phone?: string;
+    companyName?: string;
+    promoCode?: string;
+  },
 ): string {
+  const safeFullName =
+    context.fullName ||
+    [context.firstName, context.lastName].filter(Boolean).join(' ').trim();
+
   return value
     .replace(/\{\{(?:pr[eé]nom|firstName)\}\}/gi, context.firstName || '')
+    .replace(/\{\{(?:nom|lastName|surname)\}\}/gi, context.lastName || '')
+    .replace(/\{\{(?:fullName|nomComplet|name)\}\}/gi, safeFullName || '')
+    .replace(/\{\{(?:email|e-mail)\}\}/gi, context.email || '')
+    .replace(/\{\{(?:phone|tel|telephone)\}\}/gi, context.phone || '')
     .replace(
       /\{\{(?:shopName|boutique|nomBoutique)\}\}/gi,
       context.companyName || '',
@@ -56,7 +197,15 @@ function personalizeText(
 
 function renderEmailBlock(
   block: Record<string, unknown>,
-  context: { firstName?: string; companyName?: string; promoCode?: string },
+  context: {
+    firstName?: string;
+    lastName?: string;
+    fullName?: string;
+    email?: string;
+    phone?: string;
+    companyName?: string;
+    promoCode?: string;
+  },
 ): string {
   const type = typeof block.type === 'string' ? block.type : '';
   const content = asRecord(block.content) || {};
@@ -85,7 +234,7 @@ function renderEmailBlock(
     const src = typeof content.src === 'string' ? content.src : '';
     const alt = typeof content.alt === 'string' ? content.alt : 'Image';
     if (!src) return '';
-    return `<div style="margin:0 0 12px;"><img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" style="max-width:100%; width:100%; height:auto; display:block; border:0; border-radius:12px;"/></div>`;
+    return `<div style="margin:0 0 12px;"><img src="${escapeHtml(rewriteCampaignImageSource(src))}" alt="${escapeHtml(alt)}" style="max-width:100%; width:100%; height:auto; display:block; border:0; border-radius:12px;"/></div>`;
   }
 
   if (type === 'button') {
@@ -121,7 +270,9 @@ function renderEmailBlock(
   }
 
   if (type === 'html') {
-    return typeof content.html === 'string' ? content.html : '';
+    return typeof content.html === 'string'
+      ? rewriteCampaignEmailHtmlImageSources(content.html)
+      : '';
   }
 
   if (type === 'product') {
@@ -147,7 +298,7 @@ function renderEmailBlock(
       <table role="presentation" width="100%" style="border-collapse:collapse; margin:0 0 12px; border:1px solid #e5e7eb; border-radius:12px; overflow:hidden;">
         <tr>
           <td style="padding:0;">
-            ${image ? `<img src="${escapeHtml(image)}" alt="${escapeHtml(title)}" style="width:100%; max-width:100%; display:block; height:auto;"/>` : ''}
+            ${image ? `<img src="${escapeHtml(rewriteCampaignImageSource(image))}" alt="${escapeHtml(title)}" style="width:100%; max-width:100%; display:block; height:auto;"/>` : ''}
           </td>
         </tr>
         <tr>
@@ -218,7 +369,15 @@ function renderEmailBlock(
 function renderEmailHtml(
   contentJson: unknown,
   fallbackText: string,
-  context: { firstName?: string; companyName?: string; promoCode?: string },
+  context: {
+    firstName?: string;
+    lastName?: string;
+    fullName?: string;
+    email?: string;
+    phone?: string;
+    companyName?: string;
+    promoCode?: string;
+  },
 ): string {
   const body = asRecord(contentJson);
   const blocks = Array.isArray(body?.blocks)
@@ -243,6 +402,42 @@ function renderEmailHtml(
   `;
 }
 
+function resolveVariantABConfig(contentJson: unknown, variant?: 'A' | 'B') {
+  if (!variant) return undefined;
+  const body = asRecord(contentJson);
+  const abTestConfig = asRecord(body?.abTestConfig);
+  if (!abTestConfig) return undefined;
+
+  const variantKey = variant === 'B' ? 'variantB' : 'variantA';
+  return asRecord(abTestConfig[variantKey]);
+}
+
+function buildVariantEmailContentJson(
+  contentJson: unknown,
+  variantConfig: Record<string, unknown> | undefined,
+  fallbackSubject: string,
+) {
+  if (!variantConfig) return contentJson;
+  const emailHtml =
+    typeof variantConfig.emailHtml === 'string'
+      ? variantConfig.emailHtml.trim()
+      : '';
+  if (!emailHtml) return contentJson;
+
+  const base = asRecord(contentJson) || {};
+  const subject =
+    typeof variantConfig.emailSubject === 'string' &&
+    variantConfig.emailSubject.trim().length > 0
+      ? variantConfig.emailSubject
+      : fallbackSubject;
+
+  return {
+    ...base,
+    subject,
+    blocks: [{ type: 'html', content: { html: emailHtml } }],
+  };
+}
+
 @Processor('campaign-dispatch')
 export class CampaignDispatchProcessor extends WorkerHost {
   private readonly logger = new Logger(CampaignDispatchProcessor.name);
@@ -253,6 +448,7 @@ export class CampaignDispatchProcessor extends WorkerHost {
     private mailService: MailService,
     private emailProviderFactory: EmailProviderFactory,
     private smsProviderFactory: SmsProviderFactory,
+    private whatsappProviderFactory: WhatsappProviderFactory,
   ) {
     super();
   }
@@ -329,6 +525,7 @@ export class CampaignDispatchProcessor extends WorkerHost {
             email: true,
             phone: true,
             firstName: true,
+            lastName: true,
             optOut: true,
           },
         },
@@ -369,23 +566,24 @@ export class CampaignDispatchProcessor extends WorkerHost {
             return { success: false };
           }
 
-          let content = campaign.content || '';
-          // EN-1688: Message personalization with fallback values
-          if (contact.firstName)
-            content = content.replace(
-              /{{pr[eé]nom|firstName}}/gi,
-              contact.firstName,
-            );
-          if (campaign.account?.companyName)
-            content = content.replace(
-              /{{shopName|boutique|nomBoutique}}/gi,
-              campaign.account.companyName,
-            );
-          if (campaign.promoCode)
-            content = content.replace(
-              /{{promoCode|code_promo}}/gi,
-              campaign.promoCode,
-            );
+          const contactContext = {
+            firstName: contact.firstName || undefined,
+            lastName: contact.lastName || undefined,
+            fullName:
+              [contact.firstName, contact.lastName]
+                .filter(Boolean)
+                .join(' ')
+                .trim() || undefined,
+            email: contact.email || undefined,
+            phone: contact.phone || undefined,
+            companyName: campaign.account?.companyName || undefined,
+            promoCode: campaign.promoCode || undefined,
+          };
+
+          const content = personalizeText(
+            campaign.content || '',
+            contactContext,
+          );
 
           const effectiveVariant = remainingContacts
             ? variant
@@ -400,26 +598,66 @@ export class CampaignDispatchProcessor extends WorkerHost {
               : effectiveVariant === 'A'
                 ? campaign.subjectA || campaign.subject || ''
                 : campaign.subject || '';
+          const variantConfig = resolveVariantABConfig(
+            campaign.contentJson,
+            effectiveVariant,
+          );
+          const smsVariantMessage =
+            typeof variantConfig?.smsMessage === 'string'
+              ? variantConfig.smsMessage
+              : undefined;
+          const smsContent = smsVariantMessage
+            ? personalizeText(smsVariantMessage, contactContext)
+            : content;
+          const variantEmailContentJson = buildVariantEmailContentJson(
+            campaign.contentJson,
+            variantConfig,
+            subject,
+          );
+          const personalizedSubject = personalizeText(subject, {
+            firstName: contact.firstName || undefined,
+            lastName: contact.lastName || undefined,
+            fullName:
+              [contact.firstName, contact.lastName]
+                .filter(Boolean)
+                .join(' ')
+                .trim() || undefined,
+            email: contact.email || undefined,
+            phone: contact.phone || undefined,
+            companyName: campaign.account?.companyName || undefined,
+            promoCode: campaign.promoCode || undefined,
+          });
 
           if (campaign.channelType === 'SMS') {
             if (!contact.phone) {
               throw new Error('Contact phone missing');
             }
-            await this.sendSms(contact.phone, content);
+            const normalizedPhone = normalizeSmsPhoneNumber(contact.phone);
+            if (!normalizedPhone) {
+              throw new Error('Contact phone invalid');
+            }
+            await this.sendSms(normalizedPhone, smsContent);
+          } else if (campaign.channelType === 'WhatsApp') {
+            // US: Canal WhatsApp end-to-end
+            if (!contact.phone) {
+              throw new Error('Contact phone missing for WhatsApp');
+            }
+            const normalizedPhone = normalizeSmsPhoneNumber(contact.phone);
+            if (!normalizedPhone) {
+              throw new Error('Contact phone invalid for WhatsApp');
+            }
+            await this.sendWhatsApp(normalizedPhone, smsContent);
           } else {
             if (!contact.email) {
               throw new Error('Contact email missing');
             }
             await this.sendEmail(
               contact.email,
-              subject,
-              campaign.contentJson,
+              personalizedSubject,
+              variantEmailContentJson,
               content,
-              {
-                firstName: contact.firstName || undefined,
-                companyName: campaign.account?.companyName || undefined,
-                promoCode: campaign.promoCode || undefined,
-              },
+              contactContext,
+              sendRecord.id,
             );
           }
 
@@ -433,6 +671,10 @@ export class CampaignDispatchProcessor extends WorkerHost {
               sentAt: new Date(),
             },
           });
+
+          // US-016 – Atomic credit deduction per successful send
+          await this.deductSendCredit(campaign.accountId, campaign);
+
           return { success: true };
         } catch (err: unknown) {
           const errMsg = err instanceof Error ? err.message : String(err);
@@ -684,12 +926,118 @@ export class CampaignDispatchProcessor extends WorkerHost {
     } as unknown as Job<DispatchCampaignJob>);
   }
 
-  private async sendSms(phone: string, content: string) {
-    const provider = this.smsProviderFactory.getProvider();
-    const result = await provider.send(phone, content);
+  /**
+   * US-016 – Deduct one send's credit from the account balance.
+   *
+   * Cost per send:
+   *   1. campaign.estimatedCost / campaign.estimatedRecipients  (when both are set)
+   *   2. env CREDIT_COST_PER_SMS / CREDIT_COST_PER_EMAIL       (fallback)
+   *   3. 0  (if no cost information is available)
+   *
+   * Uses atomic SQL to prevent balance from going below zero:
+   *   UPDATE accounts SET credit_balance = credit_balance - cost
+   *   WHERE id = ? AND credit_balance >= cost
+   *
+   * If the account has insufficient credits the send is recorded but a warning
+   * is logged (fail-open so the campaign is not interrupted mid-flight).
+   */
+  private async deductSendCredit(
+    accountId: string,
+    campaign: {
+      estimatedCost: unknown;
+      estimatedRecipients: number;
+      channelType: string;
+    },
+  ): Promise<void> {
+    let costPerSend = 0;
 
-    if (!result.success) {
-      throw new Error(result.error || 'SMS provider send failed');
+    const estCost = Number(campaign.estimatedCost ?? 0);
+    const estRecipients = campaign.estimatedRecipients || 0;
+
+    if (estCost > 0 && estRecipients > 0) {
+      costPerSend = estCost / estRecipients;
+    } else {
+      const envKey =
+        campaign.channelType === 'SMS'
+          ? 'CREDIT_COST_PER_SMS'
+          : 'CREDIT_COST_PER_EMAIL';
+      costPerSend = parseFloat(process.env[envKey] || '0');
+    }
+
+    if (costPerSend <= 0) return;
+
+    // Atomic check-and-decrement — prevents negative balance
+    const result = await this.prisma.$executeRaw`
+      UPDATE accounts
+      SET    credit_balance = credit_balance - ${costPerSend}::decimal
+      WHERE  id = ${accountId}::uuid
+      AND    credit_balance >= ${costPerSend}::decimal
+    `;
+
+    if (result === 0) {
+      this.logger.warn(
+        `Account ${accountId} has insufficient credits for send (need ${costPerSend}).`,
+      );
+    }
+  }
+
+  private async sendWhatsApp(phone: string, content: string) {
+    try {
+      const provider = this.whatsappProviderFactory.getProvider();
+      const result = await provider.send(phone, content);
+      if (!result.success) {
+        const isPermanent = /invalid|blacklisted|unsubscribed|opt.?out/i.test(
+          result.error || '',
+        );
+        if (isPermanent) {
+          this.logger.warn(
+            `WhatsApp permanent failure to ${phone}: ${result.error}`,
+          );
+          return;
+        }
+        throw new Error(result.error || 'WhatsApp provider send failed');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isTransient = /rate.limit|timeout|503|429|network|ETIMEDOUT/i.test(
+        msg,
+      );
+      this.logger.error(
+        `WhatsApp send to ${phone} failed (${isTransient ? 'transient' : 'permanent'}): ${msg}`,
+      );
+      if (isTransient) throw err;
+    }
+  }
+
+  private async sendSms(phone: string, content: string, sendId?: string) {
+    try {
+      const provider = this.smsProviderFactory.getProvider();
+      const result = await provider.send(phone, content);
+
+      if (!result.success) {
+        const isPermanent =
+          /invalid|blacklisted|unsubscribed|opt.?out|unreachable/i.test(
+            result.error || '',
+          );
+        if (isPermanent) {
+          // erreur permanente — ne pas relancer
+          this.logger.warn(
+            `SMS permanent failure to ${phone}: ${result.error}`,
+          );
+          return; // retourner sans throw pour ne pas retriggerer le job
+        }
+        throw new Error(result.error || 'SMS provider send failed');
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isTransient = /rate.limit|timeout|503|429|network|ETIMEDOUT/i.test(
+        msg,
+      );
+      this.logger.error(
+        `SMS send to ${phone} failed (${isTransient ? 'transient' : 'permanent'}): ${msg}`,
+      );
+      if (isTransient) throw err; // BullMQ retry
+      // erreur permanente — on logue sans relancer
     }
   }
 
@@ -698,10 +1046,20 @@ export class CampaignDispatchProcessor extends WorkerHost {
     subject: string,
     contentJson: unknown,
     fallbackText: string,
-    context: { firstName?: string; companyName?: string; promoCode?: string },
+    context: {
+      firstName?: string;
+      lastName?: string;
+      fullName?: string;
+      email?: string;
+      phone?: string;
+      companyName?: string;
+      promoCode?: string;
+    },
+    sendId: string,
   ) {
     const provider = this.emailProviderFactory.getProvider();
-    const html = renderEmailHtml(contentJson, fallbackText, context);
+    const renderedHtml = renderEmailHtml(contentJson, fallbackText, context);
+    const html = applyTrackingToEmailHtml(renderedHtml, sendId);
     const result = await provider.send(email, subject, html);
 
     if (!result.success) {

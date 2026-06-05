@@ -22,6 +22,7 @@ export const CampaignChannelStep: FC<CampaignChannelStepProps> = ({ onNext }) =>
   };
 
   const isValid = draft.channel && draft.name && draft.name.length >= 3;
+  const isAutomationMode = draft.mode === 'automation';
 
   return (
     <div className="max-w-4xl mx-auto px-8 py-12 space-y-12">
@@ -41,8 +42,19 @@ export const CampaignChannelStep: FC<CampaignChannelStepProps> = ({ onNext }) =>
           Sélectionnez votre canal
         </h2>
         <p className="text-on-surface-variant max-w-2xl mx-auto">
-          Commencez par choisir le canal de communication. Vous pouvez combiner
-          SMS et Email dans une même campagne via A/B testing.
+          Choisissez un canal classique ou activez le mode automatisé pour créer une campagne sans segment.
+        </p>
+      </div>
+
+      <div className="max-w-2xl mx-auto rounded-2xl border border-primary/20 bg-primary/5 p-4 text-sm text-on-surface-variant">
+        <p className="font-semibold text-on-surface">Mode de campagne</p>
+        <div className="mt-3 inline-flex rounded-full border border-primary/20 bg-white px-4 py-2 text-sm font-semibold text-secondary">
+          {isAutomationMode ? 'Automatisation sans segment' : 'Campagne classique'}
+        </div>
+        <p className="mt-3 text-xs">
+          {isAutomationMode
+            ? 'Le mode a été défini depuis la page d’entrée. L’audience n’est pas obligatoire.'
+            : 'Le mode a été défini depuis la page d’entrée. L’audience sera choisie à l’étape suivante.'}
         </p>
       </div>
 

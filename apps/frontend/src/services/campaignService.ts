@@ -12,6 +12,52 @@ export interface CampaignResponse {
   message?: string;
 }
 
+export interface CampaignScheduleValidationResult {
+  success: boolean;
+  isValid: boolean;
+  warnings: string[];
+  immediateOrScheduled: 'immediate' | 'scheduled';
+  timezone: string;
+  scheduledAt: string | null;
+}
+
+const extractApiErrorMessage = (error: unknown, fallback: string): string => {
+  if (!error || typeof error !== 'object') return fallback;
+
+  const err = error as {
+    response?: {
+      data?: {
+        error?: unknown;
+        message?: unknown;
+      };
+    };
+    message?: unknown;
+  };
+
+  const apiError = err.response?.data?.error;
+  if (typeof apiError === 'string' && apiError.trim().length > 0) {
+    return apiError;
+  }
+
+  const apiMessage = err.response?.data?.message;
+  if (typeof apiMessage === 'string' && apiMessage.trim().length > 0) {
+    return apiMessage;
+  }
+
+  if (Array.isArray(apiMessage) && apiMessage.length > 0) {
+    const first = apiMessage.find((item) => typeof item === 'string');
+    if (typeof first === 'string' && first.trim().length > 0) {
+      return first;
+    }
+  }
+
+  if (typeof err.message === 'string' && err.message.trim().length > 0) {
+    return err.message;
+  }
+
+  return fallback;
+};
+
 /**
  * Récupérer le nombre de contacts actifs dans un segment
  */
@@ -41,6 +87,13 @@ export async function saveCampaignDraft(
     console.log('💾 Saving campaign draft:', campaignId);
     const response = await api.post(`/campaigns/${campaignId}/save-draft`, draftData);
 
+    if (!response.data?.success) {
+      return {
+        success: false,
+        error: response.data?.error || 'Erreur lors de la sauvegarde du brouillon',
+      };
+    }
+
     console.log('✅ Draft saved successfully');
     return {
       success: true,
@@ -51,7 +104,7 @@ export async function saveCampaignDraft(
     console.error('❌ Error saving draft:', error);
     return {
       success: false,
-      error: "Une erreur s'est produite. Veuillez réessayer.",
+      error: extractApiErrorMessage(error, "Une erreur s'est produite. Veuillez réessayer."),
     };
   }
 }
@@ -87,7 +140,36 @@ export async function sendCampaign(
     console.error('❌ Error sending campaign:', error);
     return {
       success: false,
-      error: "Une erreur s'est produite. Veuillez réessayer.",
+      error: extractApiErrorMessage(error, "Une erreur s'est produite. Veuillez réessayer."),
+    };
+  }
+}
+
+/**
+ * Valider la planification d'une campagne
+ */
+export async function validateCampaignSchedule(
+  campaignId: string,
+  data: {
+    immediateOrScheduled?: 'immediate' | 'scheduled';
+    scheduledAt?: string;
+    timezone?: string;
+  },
+): Promise<CampaignResponse> {
+  try {
+    const response = await api.post<CampaignScheduleValidationResult>(
+      `/campaigns/${campaignId}/validate-schedule`,
+      data,
+    );
+
+    return {
+      success: true,
+      data: response.data,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: extractApiErrorMessage(error, 'Erreur lors de la validation du planning'),
     };
   }
 }
@@ -117,7 +199,7 @@ export async function cancelCampaign(campaignId: string): Promise<CampaignRespon
     console.error('❌ Error cancelling campaign:', error);
     return {
       success: false,
-      error: "Une erreur s'est produite. Veuillez réessayer.",
+      error: extractApiErrorMessage(error, "Une erreur s'est produite. Veuillez réessayer."),
     };
   }
 }
@@ -139,7 +221,7 @@ export async function getCampaignDetails(campaignId: string): Promise<CampaignRe
     console.error('❌ Error fetching campaign:', error);
     return {
       success: false,
-      error: "Une erreur s'est produite. Veuillez réessayer.",
+      error: extractApiErrorMessage(error, "Une erreur s'est produite. Veuillez réessayer."),
     };
   }
 }

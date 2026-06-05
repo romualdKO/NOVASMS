@@ -18,6 +18,7 @@ import {
 import { FileInterceptor } from '@nestjs/platform-express';
 import { memoryStorage } from 'multer';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { UserRole } from '@prisma/client';
 import { CampaignsService } from './campaigns.service';
 import { FileUploadService } from './file-upload.service';
 import type { Request as ExpressRequest } from 'express';
@@ -27,12 +28,13 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { UseGuards } from '@nestjs/common';
 import { EmailProviderFactory } from '../providers/email/email.provider.factory';
 import { SmsProviderFactory } from '../providers/sms/sms.provider.factory';
+import { RolesGuard, RequireRoles } from '../common';
 
 type TenantRequest = ExpressRequest & { accountId?: string };
 
 @ApiTags('Campaigns')
 @Controller('campaigns')
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, RolesGuard)
 @ApiBearerAuth()
 export class CampaignsController {
   constructor(
@@ -47,7 +49,7 @@ export class CampaignsController {
    * Ne declenche aucun envoi, expose uniquement l'etat de configuration.
    */
   @Get('providers/health')
-  async providersHealth() {
+  providersHealth() {
     return {
       success: true,
       email: this.emailProviderFactory.getHealthStatus(),
@@ -55,11 +57,16 @@ export class CampaignsController {
     };
   }
 
+  @RequireRoles(UserRole.Admin, UserRole.Editor)
   @Post()
   async create(@Body() body: unknown, @Request() req: TenantRequest) {
     const segmentId = (body as { segmentId?: string } | null)?.segmentId;
+    // Prefer the injected tenant accountId, but fall back to token's user if present
+    const tokenAccountId =
+      (req as any)?.user?.accountId || (req as any)?.user?.sub;
     const accountId =
       req.accountId ??
+      tokenAccountId ??
       (segmentId
         ? await this.campaignsService.findAccountIdBySegmentId(segmentId)
         : await this.campaignsService.findFirstAccountId());
@@ -68,10 +75,31 @@ export class CampaignsController {
   }
 
   @Get()
-  async list(@Request() req: TenantRequest) {
+  async list(
+    @Request() req: TenantRequest,
+    @Query('status') status?: string,
+    @Query('channel') channel?: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('search') search?: string,
+  ) {
     const accountId = req.accountId;
     if (!accountId) throw new Error('accountId manquant');
-    return { data: await this.campaignsService.list(accountId) };
+    return this.campaignsService.list(accountId, {
+      status,
+      channel,
+      page: page ? Number(page) : undefined,
+      limit: limit ? Number(limit) : undefined,
+      search,
+    });
+  }
+
+  @RequireRoles(UserRole.Admin, UserRole.Editor)
+  @Post(':id/duplicate')
+  async duplicate(@Param('id') id: string, @Request() req: TenantRequest) {
+    const accountId = req.accountId;
+    if (!accountId) throw new Error('accountId manquant');
+    return this.campaignsService.duplicateCampaign(accountId, id);
   }
 
   @Get(':id')
@@ -81,6 +109,7 @@ export class CampaignsController {
     return this.campaignsService.get(accountId, id);
   }
 
+  @RequireRoles(UserRole.Admin, UserRole.Editor)
   @Patch(':id')
   async update(
     @Param('id') id: string,
@@ -90,7 +119,14 @@ export class CampaignsController {
     const accountId = req.accountId;
     if (!accountId) throw new Error('accountId manquant');
     const result = await this.campaignsService.update(accountId, id, body);
-    console.log('[DEBUG] controller.update body param:', (body as any)?.segmentId, 'req.body:', (req as any).body, 'result.segmentId:', (result as any)?.segmentId);
+    console.log(
+      '[DEBUG] controller.update body param:',
+      (body as any)?.segmentId,
+      'req.body:',
+      (req as any).body,
+      'result.segmentId:',
+      (result as any)?.segmentId,
+    );
     // Some clients/tests expect a scalar `segmentId` even when the DB
     // returned null; if the caller requested a segment connect, mirror it.
     try {
@@ -105,6 +141,24 @@ export class CampaignsController {
     return result;
   }
 
+  @Post(':id/validate-schedule')
+  async validateSchedule(
+    @Param('id') id: string,
+    @Body()
+    body: {
+      immediateOrScheduled?: 'immediate' | 'scheduled';
+      scheduledAt?: string;
+      timezone?: string;
+    },
+    @Request() req: TenantRequest,
+  ) {
+    const accountId = req.accountId;
+    if (!accountId) throw new Error('accountId manquant');
+
+    return this.campaignsService.validateSchedule(accountId, id, body);
+  }
+
+  @RequireRoles(UserRole.Admin, UserRole.Editor)
   @Delete(':id')
   async delete(@Param('id') id: string, @Request() req: TenantRequest) {
     const accountId = req.accountId;
@@ -193,6 +247,22 @@ export class CampaignsController {
     }
   }
 
+  @Get('images/:fileName/presign')
+  async presignImage(
+    @Param('fileName') fileName: string,
+    @Query('expires') expires?: string,
+  ) {
+    const expiresSeconds = expires ? Number(expires) : 3600;
+    const url = await this.fileUploadService.getPresignedGetUrl(
+      fileName,
+      expiresSeconds,
+    );
+    if (!url) {
+      throw new HttpException('Presigned URL not available', 400);
+    }
+    return { url, expires: expiresSeconds };
+  }
+
   @Get(':campaignId/images')
   async getCampaignImages(
     @Param('campaignId') campaignId: string,
@@ -224,6 +294,7 @@ export class CampaignsController {
     return { success: true };
   }
 
+  @RequireRoles(UserRole.Admin, UserRole.Editor)
   @Post(':id/send')
   @HttpCode(HttpStatus.OK)
   async sendCampaign(
@@ -238,7 +309,9 @@ export class CampaignsController {
   ) {
     const campaign = await this.campaignsService.findById(id);
     if (!campaign) {
-      return res.status(404).json({ success: false, error: 'Campagne non trouvée' });
+      return res
+        .status(404)
+        .json({ success: false, error: 'Campagne non trouvée' });
     }
 
     const accountId = req.accountId ?? campaign.accountId;
@@ -257,14 +330,17 @@ export class CampaignsController {
         scheduledAt: scheduledAt || undefined,
       });
       // Ensure response includes a `status` for older callers expecting it
-      if (immediateOrScheduled === 'immediate' && !(result as any).status) {
-        (result as any).status = 'SENDING';
+      if (immediateOrScheduled === 'immediate' && !result.status) {
+        result.status = 'SENDING';
       }
 
       // For some clients (Sprint3 tests) we return 201 when the caller explicitly
       // requested `immediate` in the body. For older callers that use
       // `sendImmediately: true` we keep returning 200.
-      if (immediateOrScheduled === 'immediate' && body?.immediateOrScheduled === 'immediate') {
+      if (
+        immediateOrScheduled === 'immediate' &&
+        body?.immediateOrScheduled === 'immediate'
+      ) {
         return res.status(201).json(result);
       }
 

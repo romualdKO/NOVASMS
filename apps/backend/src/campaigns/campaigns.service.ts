@@ -8,6 +8,7 @@ import {
 import {
   Prisma,
   CampaignVariant,
+  Campaign,
   CampaignStatus,
   SendVariant,
 } from '@prisma/client';
@@ -42,10 +43,59 @@ function asOptionalDecimal(value: unknown): Prisma.Decimal | undefined {
   }
 }
 
+function normalizeSmsPhoneNumber(phone: string): string | null {
+  const cleaned = phone.replace(/[\s().-]/g, '').trim();
+
+  if (/^\+\d{8,15}$/.test(cleaned)) {
+    return cleaned;
+  }
+
+  if (/^00\d{8,15}$/.test(cleaned)) {
+    const normalized = `+${cleaned.slice(2)}`;
+    return /^\+\d{8,15}$/.test(normalized) ? normalized : null;
+  }
+
+  if (/^\d{8,15}$/.test(cleaned)) {
+    return `+${cleaned}`;
+  }
+
+  return null;
+}
+
+function normalizeTimeZone(timezone?: string | null): string {
+  const fallback = 'Africa/Abidjan';
+  if (!timezone || timezone.trim().length === 0) return fallback;
+
+  try {
+    new Intl.DateTimeFormat('fr-FR', { timeZone: timezone.trim() });
+    return timezone.trim();
+  } catch {
+    return fallback;
+  }
+}
+
+function validateScheduledAtValue(scheduledAt?: unknown): Date | null {
+  const parsed = asOptionalDate(scheduledAt);
+  if (!parsed) return null;
+  if (parsed.getTime() <= Date.now()) {
+    throw new BadRequestException('scheduledAt cannot be in the past');
+  }
+  return parsed;
+}
+
 function extractRecord(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    return undefined;
   return value as Record<string, unknown>;
 }
+
+type CampaignListOptions = {
+  status?: string;
+  channel?: string;
+  page?: number;
+  limit?: number;
+  search?: string;
+};
 
 @Injectable()
 export class CampaignsService {
@@ -58,7 +108,7 @@ export class CampaignsService {
     @InjectQueue('campaign-schedule') private scheduleQueue: Queue,
   ) {}
 
-  async create(accountId: string, data: unknown) {
+  async create(accountId: string, data: unknown): Promise<Campaign> {
     const body = asRecord(data);
     if (!body) throw new BadRequestException('Payload invalide');
 
@@ -70,11 +120,11 @@ export class CampaignsService {
     const emailContent = extractRecord(body.emailContent);
     const smsContent = extractRecord(body.smsContent);
 
-    const scheduledAt = asOptionalDate(body.scheduledAt);
+    const scheduledAt = validateScheduledAtValue(body.scheduledAt);
     const normalizedStatus = rawStatus.toUpperCase();
     const finalStatus = scheduledAt
       ? CampaignStatus.SCHEDULED
-      : ((normalizedStatus as CampaignStatus) || CampaignStatus.DRAFT);
+      : (normalizedStatus as CampaignStatus) || CampaignStatus.DRAFT;
 
     if (!scheduledAt && normalizedStatus === 'SCHEDULED') {
       throw new BadRequestException(
@@ -101,7 +151,7 @@ export class CampaignsService {
         /* ignore */
       }
     } else if (body.contentJson && typeof body.contentJson === 'object') {
-      contentJson = body.contentJson as Prisma.InputJsonValue;
+      contentJson = body.contentJson;
     }
 
     // Correction bestSendTime: utiliser Prisma.JsonNull si null/undefined
@@ -129,7 +179,7 @@ export class CampaignsService {
         typeof body.abTestDuration === 'number' ? body.abTestDuration : 4,
       segmentId: asOptionalString(body.segmentId),
       scheduledAt,
-      timezone: asOptionalString(body.timezone) ?? 'Africa/Abidjan',
+      timezone: normalizeTimeZone(asOptionalString(body.timezone)),
       estimatedCost: asOptionalDecimal(body.estimatedCost),
       bestSendTime: bestSendTimeValue,
       // EN-1688: Personalization variables
@@ -139,7 +189,7 @@ export class CampaignsService {
     // Debugging: log payload sizes to troubleshoot Prisma P2000 column-too-long errors
     const fieldLengths: Record<string, number | null> = {};
     for (const key of Object.keys(payload)) {
-      const v: unknown = (payload as any)[key];
+      const v: unknown = (payload as Record<string, unknown>)[key];
       if (typeof v === 'string') fieldLengths[key] = v.length;
       else if (v === null || v === undefined) fieldLengths[key] = null;
       else {
@@ -155,16 +205,21 @@ export class CampaignsService {
     console.log('[DEBUG] Creating campaign payload lengths:', fieldLengths);
 
     // Validate name length to avoid Prisma P2000 when clients send too-long names
-    const nameValue = payload.name as string | undefined;
+    const nameValue = payload.name;
     if (typeof nameValue === 'string' && nameValue.length > 255) {
-      throw new BadRequestException('Le nom de la campagne est trop long (max 255 caractères)');
+      throw new BadRequestException(
+        'Le nom de la campagne est trop long (max 255 caractères)',
+      );
     }
 
     let campaign;
     try {
       campaign = await this.prisma.campaign.create({ data: payload });
     } catch (err: unknown) {
-      console.error('[DEBUG] prisma.campaign.create failed, payload:', JSON.stringify(payload).slice(0, 2000));
+      console.error(
+        '[DEBUG] prisma.campaign.create failed, payload:',
+        JSON.stringify(payload).slice(0, 2000),
+      );
       console.error('[DEBUG] Field lengths:', fieldLengths);
       // rethrow to preserve original error (so tests see failure) but log extra context
       throw err as Error;
@@ -173,21 +228,32 @@ export class CampaignsService {
     // Basic validation for SMS content: require STOP to unsubscribe
     if (channelType === 'SMS') {
       const contentText = (body.content || '') as string;
-      if (!/\bSTOP\b/i.test(contentText)) {
+      if (contentText.trim().length > 0 && !/\bSTOP\b/i.test(contentText)) {
         // rollback created campaign to keep DB clean for tests
         await this.prisma.campaign.delete({ where: { id: campaign.id } });
-        throw new BadRequestException('SMS content must include STOP to unsubscribe');
+        throw new BadRequestException(
+          'SMS content must include STOP to unsubscribe',
+        );
       }
     }
 
     // Basic validation for EMAIL content: ensure URLs look valid in button blocks
-    if (channelType === 'EMAIL' && contentJson && typeof contentJson === 'object') {
+    if (
+      channelType === 'EMAIL' &&
+      contentJson &&
+      typeof contentJson === 'object'
+    ) {
       try {
-        const cj = contentJson as any;
+        const cj = contentJson as { blocks?: unknown[] };
         if (cj.blocks && Array.isArray(cj.blocks)) {
           for (const b of cj.blocks) {
-            if (b && b.type === 'button' && b.content && b.content.url) {
-              const url = String(b.content.url || '').trim();
+            const block = asRecord(b);
+            const content = asRecord(block?.content);
+            if (
+              block?.['type'] === 'button' &&
+              typeof content?.['url'] === 'string'
+            ) {
+              const url = content['url'].trim();
               // Simple URL validation
               try {
                 const parsed = new URL(url);
@@ -196,7 +262,9 @@ export class CampaignsService {
                 }
               } catch {
                 // rollback created campaign
-                await this.prisma.campaign.delete({ where: { id: campaign.id } });
+                await this.prisma.campaign.delete({
+                  where: { id: campaign.id },
+                });
                 throw new BadRequestException('Invalid URL in content');
               }
             }
@@ -247,15 +315,59 @@ export class CampaignsService {
     return campaign;
   }
 
-  async list(accountId: string) {
-    return this.prisma.campaign.findMany({
-      where: { accountId },
-      orderBy: { createdAt: 'desc' },
-      include: { segment: { select: { name: true } } },
-    });
+  async list(
+    accountId: string,
+    options?: CampaignListOptions,
+  ): Promise<{ data: Campaign[]; total: number; page: number; limit: number }> {
+    const rawPage = Number(options?.page ?? 1);
+    const rawLimit = Number(options?.limit ?? 20);
+    const page = Number.isFinite(rawPage) && rawPage > 0 ? rawPage : 1;
+    const limit = Number.isFinite(rawLimit)
+      ? Math.min(Math.max(rawLimit, 1), 100)
+      : 20;
+    const skip = (page - 1) * limit;
+
+    const where: Prisma.CampaignWhereInput = { accountId };
+
+    const statusInput = options?.status?.toUpperCase();
+    if (statusInput && statusInput in CampaignStatus) {
+      where.status = statusInput as CampaignStatus;
+    }
+
+    const channelInput = options?.channel?.toUpperCase();
+    if (channelInput) {
+      where.channelType = channelInput;
+    }
+
+    const search = options?.search?.trim();
+    if (search) {
+      where.name = { contains: search, mode: 'insensitive' };
+    }
+
+    const [data, total] = await this.prisma.$transaction([
+      this.prisma.campaign.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        include: { segment: { select: { name: true } } },
+        skip,
+        take: limit,
+      }),
+      this.prisma.campaign.count({ where }),
+    ]);
+
+    return {
+      data,
+      total,
+      page,
+      limit,
+    };
   }
 
-  async update(accountId: string, id: string, data: unknown) {
+  async update(
+    accountId: string,
+    id: string,
+    data: unknown,
+  ): Promise<Partial<Campaign> | null> {
     const body = asRecord(data);
     if (!body) throw new BadRequestException('Payload invalide');
 
@@ -280,13 +392,17 @@ export class CampaignsService {
       payload.content = asOptionalString(body.content);
     if (body.channelType || body.channel || emailContent || smsContent) {
       const channelType =
-        asOptionalString(body.channelType) || asOptionalString(body.channel) || campaign.channelType;
+        asOptionalString(body.channelType) ||
+        asOptionalString(body.channel) ||
+        campaign.channelType;
       if (channelType === 'EMAIL' && emailContent) {
         payload.contentJson = emailContent as Prisma.InputJsonValue;
-        payload.content = asOptionalString(emailContent.subject) || payload.content;
+        payload.content =
+          asOptionalString(emailContent.subject) || payload.content;
       } else if (channelType === 'SMS' && smsContent) {
         payload.contentJson = smsContent as Prisma.InputJsonValue;
-        payload.content = asOptionalString(smsContent.message) || payload.content;
+        payload.content =
+          asOptionalString(smsContent.message) || payload.content;
       }
     }
     if (body.contentJson !== undefined) {
@@ -295,7 +411,7 @@ export class CampaignsService {
           typeof body.contentJson === 'string'
             ? (JSON.parse(body.contentJson) as Prisma.InputJsonValue)
             : (body.contentJson as Prisma.InputJsonValue);
-        payload.contentJson = parsed as Prisma.InputJsonValue;
+        payload.contentJson = parsed;
         // If nested subject provided inside contentJson, map it to top-level subject
         if (parsed && typeof parsed === 'object' && 'subject' in parsed) {
           payload.subject = asOptionalString((parsed as any).subject);
@@ -309,8 +425,15 @@ export class CampaignsService {
       console.log('[DEBUG] update called with segmentId:', segmentId);
       if (segmentId) {
         // verify segment exists and belongs to the account
-        const seg = await this.prisma.segment.findUnique({ where: { id: segmentId } });
-        console.log('[DEBUG] found segment for connect:', seg?.id, 'accountId:', seg?.accountId);
+        const seg = await this.prisma.segment.findUnique({
+          where: { id: segmentId },
+        });
+        console.log(
+          '[DEBUG] found segment for connect:',
+          seg?.id,
+          'accountId:',
+          seg?.accountId,
+        );
         if (!seg || seg.accountId !== accountId) {
           throw new BadRequestException('Segment introuvable');
         }
@@ -335,12 +458,12 @@ export class CampaignsService {
     try {
       // Handle scheduling update: if scheduledAt provided, set status and enqueue job
       if (body.scheduledAt !== undefined) {
-          const scheduled = asOptionalDate(body.scheduledAt);
-          if (!scheduled) throw new BadRequestException('scheduledAt invalide');
-          // Do not allow scheduling in the past
-          if (scheduled.getTime() <= Date.now()) {
-            throw new BadRequestException('scheduledAt cannot be in the past');
-          }
+        const scheduled = asOptionalDate(body.scheduledAt);
+        if (!scheduled) throw new BadRequestException('scheduledAt invalide');
+        // Do not allow scheduling in the past
+        if (scheduled.getTime() <= Date.now()) {
+          throw new BadRequestException('scheduledAt cannot be in the past');
+        }
         payload.scheduledAt = scheduled;
         payload.status = CampaignStatus.SCHEDULED;
         // create schedule job
@@ -348,8 +471,16 @@ export class CampaignsService {
         try {
           await this.scheduleQueue.add(
             'trigger-campaign',
-            { campaignId: campaign.id, accountId, channelType: campaign.channelType },
-            { delay: delayMs, jobId: `sched-${campaign.id}`, removeOnComplete: true },
+            {
+              campaignId: campaign.id,
+              accountId,
+              channelType: campaign.channelType,
+            },
+            {
+              delay: delayMs,
+              jobId: `sched-${campaign.id}`,
+              removeOnComplete: true,
+            },
           );
         } catch (err) {
           this.logger.warn('Failed to enqueue schedule job: ' + String(err));
@@ -392,7 +523,10 @@ export class CampaignsService {
         (refreshed as any).segmentId = requested;
       }
 
-      console.log('[DEBUG] campaign update result:', { updatedId: updated.id, segmentId: refreshed?.segmentId });
+      console.log('[DEBUG] campaign update result:', {
+        updatedId: updated.id,
+        segmentId: refreshed?.segmentId,
+      });
       return refreshed;
     } catch (err: unknown) {
       // Translate Prisma errors for nicer test messages
@@ -406,12 +540,66 @@ export class CampaignsService {
   async deleteCampaign(accountId: string, id: string) {
     const campaign = await this.prisma.campaign.findFirst({
       where: { id, accountId },
-      select: { id: true },
+      select: { id: true, status: true },
     });
     if (!campaign) throw new BadRequestException('Campagne introuvable');
 
     await this.prisma.campaign.delete({ where: { id: campaign.id } });
     return { success: true, id: campaign.id };
+  }
+
+  async duplicateCampaign(accountId: string, id: string) {
+    const campaign = await this.prisma.campaign.findFirst({
+      where: { id, accountId },
+    });
+
+    if (!campaign) {
+      throw new NotFoundException('Campagne introuvable');
+    }
+
+    const duplicate = await this.prisma.campaign.create({
+      data: {
+        accountId,
+        name: `${campaign.name} (copie)`,
+        channelType: campaign.channelType,
+        status: CampaignStatus.DRAFT,
+        subject: campaign.subject,
+        subjectA: campaign.subjectA,
+        subjectB: campaign.subjectB,
+        content: campaign.content,
+        contentJson:
+          campaign.contentJson === null
+            ? Prisma.JsonNull
+            : (campaign.contentJson as Prisma.InputJsonValue),
+        abSplitPct: campaign.abSplitPct,
+        abTestDuration: campaign.abTestDuration,
+        segmentId: campaign.segmentId,
+        timezone: campaign.timezone,
+        bestSendTime:
+          campaign.bestSendTime === null
+            ? Prisma.JsonNull
+            : (campaign.bestSendTime as Prisma.InputJsonValue),
+        estimatedCost: campaign.estimatedCost,
+        estimatedRecipients: campaign.estimatedRecipients,
+        promoCode: campaign.promoCode,
+        scheduledAt: null,
+        abWinner: null,
+        sentCount: 0,
+        deliveredCount: 0,
+        openedCount: 0,
+        clickedCount: 0,
+        failedCount: 0,
+        sentCountA: 0,
+        sentCountB: 0,
+        openedCountA: 0,
+        openedCountB: 0,
+        clickedCountA: 0,
+        clickedCountB: 0,
+      },
+      include: { segment: { select: { name: true } } },
+    });
+
+    return duplicate;
   }
 
   async get(accountId: string, id: string) {
@@ -712,23 +900,66 @@ export class CampaignsService {
       const shouldRestrictEmailDelivery =
         campaign.channelType === 'EMAIL' && Boolean(emailTestRecipient);
 
-      const deliveryContacts = shouldRestrictEmailDelivery
+      const emailDeliveryContacts = shouldRestrictEmailDelivery
         ? contacts.filter(
             (contact) => contact.email && contact.email === emailTestRecipient,
           )
         : contacts;
 
-      if (shouldRestrictEmailDelivery && deliveryContacts.length === 0) {
+      if (shouldRestrictEmailDelivery && emailDeliveryContacts.length === 0) {
         return {
           success: false,
           error: `Aucun contact du segment ne correspond au destinataire de test ${emailTestRecipient}`,
         };
       }
 
-      if (shouldRestrictEmailDelivery && deliveryContacts.length < contacts.length) {
+      if (
+        shouldRestrictEmailDelivery &&
+        emailDeliveryContacts.length < contacts.length
+      ) {
         this.logger.log(
-          `Email test mode: restricting delivery from ${contacts.length} contacts to ${deliveryContacts.length} contact(s) matching ${emailTestRecipient}`,
+          `Email test mode: restricting delivery from ${contacts.length} contacts to ${emailDeliveryContacts.length} contact(s) matching ${emailTestRecipient}`,
         );
+      }
+
+      const smsRejectedContacts: Array<{ id: string; phone: string | null }> =
+        [];
+      const deliveryContacts =
+        campaign.channelType === 'SMS'
+          ? emailDeliveryContacts.filter((contact) => {
+              const normalizedPhone =
+                typeof contact.phone === 'string'
+                  ? normalizeSmsPhoneNumber(contact.phone)
+                  : null;
+
+              if (!normalizedPhone) {
+                smsRejectedContacts.push({
+                  id: contact.id,
+                  phone: contact.phone ?? null,
+                });
+                return false;
+              }
+
+              return true;
+            })
+          : emailDeliveryContacts;
+
+      if (campaign.channelType === 'SMS' && smsRejectedContacts.length > 0) {
+        const samples = smsRejectedContacts
+          .slice(0, 5)
+          .map((contact) => `${contact.id}:${contact.phone || 'no-phone'}`)
+          .join(', ');
+        this.logger.warn(
+          `SMS delivery: excluded ${smsRejectedContacts.length} contact(s) without a valid phone number for campaign ${campaignId}${samples ? ` (${samples}${smsRejectedContacts.length > 5 ? ', ...' : ''})` : ''}`,
+        );
+      }
+
+      if (campaign.channelType === 'SMS' && deliveryContacts.length === 0) {
+        return {
+          success: false,
+          error:
+            'Aucun contact avec un numéro de téléphone valide dans ce segment',
+        };
       }
 
       // Immediate sends must enter SENDING so dispatch workers can process PENDING rows.
@@ -744,7 +975,9 @@ export class CampaignsService {
       }
 
       const isABCampaign = Boolean(campaign.subjectB);
-      const shuffledContacts = [...deliveryContacts].sort(() => Math.random() - 0.5);
+      const shuffledContacts = [...deliveryContacts].sort(
+        () => Math.random() - 0.5,
+      );
       const requestedTestPct = campaign.abSplitPct || 50;
       const normalizedTestPct = Math.max(0, Math.min(100, requestedTestPct));
 
@@ -845,16 +1078,16 @@ export class CampaignsService {
         }
       }
 
-      const resObj: any = {
+      const resObj: Record<string, unknown> = {
         success: true,
         campaignId,
-        contactCount: contacts.length,
+        contactCount: deliveryContacts.length,
         abTestSampleSize,
         abRemainingSize:
           isABCampaign && abTestSampleSize > 0
-            ? contacts.length - abTestSampleSize
+            ? deliveryContacts.length - abTestSampleSize
             : 0,
-        message: `Campagne prête à être envoyée à ${contacts.length} contact(s)`,
+        message: `Campagne prête à être envoyée à ${deliveryContacts.length} contact(s)`,
       };
 
       // Indicate immediate sending status for controller/tests
@@ -867,9 +1100,13 @@ export class CampaignsService {
       return resObj;
     } catch (error) {
       this.logger.error(`Error sending campaign: ${String(error)}`);
+      const errorMessage =
+        error instanceof Error && error.message.trim().length > 0
+          ? error.message
+          : "Une erreur s'est produite. Veuillez réessayer.";
       return {
         success: false,
-        error: "Une erreur s'est produite. Veuillez réessayer.",
+        error: errorMessage,
       };
     }
   }
@@ -877,17 +1114,38 @@ export class CampaignsService {
   /**
    * Sauvegarder la campagne comme brouillon
    */
-  async saveDraft(accountId: string, campaignId: string, data: unknown) {
+  async saveDraft(
+    accountId: string,
+    campaignId: string,
+    data: unknown,
+  ): Promise<Prisma.CampaignGetPayload<{}>> {
     try {
       const body = asRecord(data);
       if (!body) {
-        return { success: false, error: 'Données invalides' };
+        throw new BadRequestException('Données invalides');
+      }
+
+      // Temporary debug: log incoming payload (truncated) to diagnose 400 on saveDraft
+      try {
+        const bodyPreview = JSON.stringify(body).slice(0, 2000);
+        this.logger.debug('[DEBUG] saveDraft received body: ' + bodyPreview);
+      } catch (err) {
+        this.logger.debug(
+          '[DEBUG] saveDraft received body (could not stringify)',
+        );
       }
 
       const updateData: Prisma.CampaignUpdateInput = {
+        // default to DRAFT unless client explicitly requests AUTOMATION
         status: CampaignStatus.DRAFT,
         updatedAt: new Date(),
       };
+
+      // Preserve AUTOMATION status when client requests it
+      const rawRequestedStatus = asOptionalString(body.status)?.toUpperCase();
+      if (rawRequestedStatus === 'AUTOMATION') {
+        updateData.status = CampaignStatus.AUTOMATION;
+      }
 
       if (body.name !== undefined)
         updateData.name = asOptionalString(body.name);
@@ -917,7 +1175,15 @@ export class CampaignsService {
         updateData.abSplitPct =
           typeof body.abSplitPct === 'number' ? body.abSplitPct : 50;
       if (body.timezone !== undefined)
-        updateData.timezone = asOptionalString(body.timezone);
+        updateData.timezone = normalizeTimeZone(
+          asOptionalString(body.timezone),
+        );
+      if (body.scheduledAt !== undefined) {
+        const scheduled = validateScheduledAtValue(body.scheduledAt);
+        if (!scheduled) throw new BadRequestException('scheduledAt invalide');
+        updateData.scheduledAt = scheduled;
+        updateData.status = CampaignStatus.SCHEDULED;
+      }
       if (body.estimatedRecipients !== undefined)
         updateData.estimatedRecipients =
           typeof body.estimatedRecipients === 'number'
@@ -928,14 +1194,37 @@ export class CampaignsService {
       if (body.promoCode !== undefined)
         updateData.promoCode = asOptionalString(body.promoCode);
 
-      const updated = await this.prisma.campaign.update({
+      const existing = await this.prisma.campaign.findFirst({
         where: { id: campaignId, accountId },
-        data: updateData,
+        select: { id: true },
       });
 
-      return updated;
+      if (!existing) {
+        throw new BadRequestException('Campagne introuvable');
+      }
+
+      // Log payload for debugging P2000 / type errors
+      try {
+        this.logger.debug(
+          `saveDraft updateData keys: ${Object.keys(updateData).join(', ')}`,
+        );
+        const updated = await this.prisma.campaign.update({
+          where: { id: campaignId },
+          data: updateData,
+        });
+
+        return updated;
+      } catch (err) {
+        // Log full stack to help diagnose Prisma errors in dev
+        this.logger.error(
+          'prisma.campaign.update failed in saveDraft',
+          (err as any)?.stack ?? String(err),
+        );
+        throw err as Error;
+      }
     } catch (error) {
-      this.logger.error(`Error saving draft: ${String(error)}`);
+      this.logger.error(`Error saving draft (outer): ${String(error)}`);
+      // Keep user-friendly message but surface logs server-side
       throw new BadRequestException(
         'Erreur lors de la sauvegarde du brouillon',
       );
@@ -945,7 +1234,10 @@ export class CampaignsService {
   /**
    * Annuler une campagne (DRAFT ou SCHEDULED seulement)
    */
-  async cancelCampaign(accountId: string, campaignId: string) {
+  async cancelCampaign(
+    accountId: string,
+    campaignId: string,
+  ): Promise<Prisma.CampaignGetPayload<{}>> {
     try {
       const campaign = await this.prisma.campaign.findFirst({
         where: { id: campaignId, accountId },
@@ -985,5 +1277,51 @@ export class CampaignsService {
       this.logger.error(`Error cancelling campaign: ${String(error)}`);
       throw error;
     }
+  }
+
+  async validateSchedule(accountId: string, campaignId: string, data: unknown) {
+    const campaign = await this.prisma.campaign.findFirst({
+      where: { id: campaignId, accountId },
+      select: { id: true, name: true, channelType: true, segmentId: true },
+    });
+
+    if (!campaign) {
+      throw new NotFoundException('Campagne non trouvée');
+    }
+
+    const body = asRecord(data);
+    if (!body) {
+      throw new BadRequestException('Données invalides');
+    }
+
+    const immediateOrScheduled =
+      asOptionalString(body.immediateOrScheduled) === 'scheduled'
+        ? 'scheduled'
+        : 'immediate';
+    const timezone = normalizeTimeZone(asOptionalString(body.timezone));
+    const scheduledAt =
+      immediateOrScheduled === 'scheduled'
+        ? validateScheduledAtValue(body.scheduledAt)
+        : null;
+
+    const warnings: string[] = [];
+    if (campaign.channelType === 'SMS') {
+      warnings.push(
+        'Vérifiez que les numéros de téléphone sont normalisés avant l’envoi.',
+      );
+    }
+
+    return {
+      success: true,
+      campaignId: campaign.id,
+      campaignName: campaign.name,
+      channelType: campaign.channelType,
+      segmentId: campaign.segmentId,
+      timezone,
+      immediateOrScheduled,
+      scheduledAt: scheduledAt?.toISOString() ?? null,
+      isValid: true,
+      warnings,
+    };
   }
 }
